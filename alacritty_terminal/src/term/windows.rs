@@ -28,8 +28,12 @@ pub fn adjust_to_conpty_resize_behavior<T>(term: &mut Term<T>, history_size_befo
         }
         if scroll_lines > 0 {
             term.scroll_down_relative(term.topmost_line(), scroll_lines as usize);
-            term.grid.cursor.point.line += scroll_lines;
-            term.grid.saved_cursor.point.line += scroll_lines;
+            // Clamp into the viewport: scrolling the cursor down by `scroll_lines` can push it
+            // past `bottommost_line()` when the cursor is already near the bottom, and any later
+            // access (damage tracking / `cursor_cell`) would then index out of bounds. (AIR-5316)
+            let max_line = term.bottommost_line().0;
+            term.grid.cursor.point.line = Line((term.grid.cursor.point.line.0 + scroll_lines).clamp(0, max_line));
+            term.grid.saved_cursor.point.line = Line((term.grid.saved_cursor.point.line.0 + scroll_lines).clamp(0, max_line));
             // scroll down introduces blank lines at the top of the history - remove them
             term.grid.decrease_scroll_limit(scroll_lines as usize);
         }
@@ -39,8 +43,11 @@ pub fn adjust_to_conpty_resize_behavior<T>(term: &mut Term<T>, history_size_befo
         // scroll up introduces blank lines at the bottom of the screen (similar to scroll down)
         // however these can stay
         term.scroll_up_relative(Line(0), scroll_lines as usize);
-        term.grid.cursor.point.line -= scroll_lines;
-        term.grid.saved_cursor.point.line -= scroll_lines;
+        // Clamp into the viewport: scrolling the cursor up by `scroll_lines` can drive its line
+        // negative, which underflows to a huge `usize` when indexing the grid. (AIR-5316)
+        let max_line = term.bottommost_line().0;
+        term.grid.cursor.point.line = Line((term.grid.cursor.point.line.0 - scroll_lines).clamp(0, max_line));
+        term.grid.saved_cursor.point.line = Line((term.grid.saved_cursor.point.line.0 - scroll_lines).clamp(0, max_line));
     }
     term.mark_fully_damaged();
 }
