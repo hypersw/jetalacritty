@@ -35,22 +35,28 @@ pub fn adjust_to_conpty_resize_behavior<T>(term: &mut Term<T>, history_size_befo
                 break;
             }
         }
+        // AIR-5316: never scroll the cursor's own line out of the viewport. The cursor is a
+        // viewport row (0..=bottommost) and marks the terminal's growth point; scrolling it past
+        // the bottom ejects the trailing blank line into history -- where the cursor cannot follow,
+        // because it is a viewport coordinate -- so the clamp lands it on real content and the next
+        // write overwrites that line. Cap the scroll to the cursor's distance from the bottom so the
+        // growth point stays in view (and on its blank line). Extra blank lines *strictly below* the
+        // cursor are still consumed, preserving this sync's original line-wrap purpose.
+        let max_scroll = (term.bottommost_line().0 - term.grid.cursor.point.line.0).max(0);
+        let computed_scroll = scroll_lines;
+        let scroll_lines = scroll_lines.min(max_scroll);
+        log::warn!(
+            "AIR-5316 shrink-cap: computed_scroll={computed_scroll} max_scroll={max_scroll} scroll_lines={scroll_lines}"
+        );
         if scroll_lines > 0 {
             term.scroll_down_relative(term.topmost_line(), scroll_lines as usize);
-            // Clamp into the viewport: scrolling the cursor down by `scroll_lines` can push it
-            // past `bottommost_line()` when the cursor is already near the bottom, and any later
-            // access (damage tracking / `cursor_cell`) would then index out of bounds. (AIR-5316)
+            // The cap above guarantees the cursor stays <= bottommost; clamp anyway as a defensive
+            // backstop against any unexpected pre-resize cursor position. (AIR-5316)
             let max_line = term.bottommost_line().0;
-            let raw_new = term.grid.cursor.point.line.0 + scroll_lines;
-            term.grid.cursor.point.line = Line(raw_new.clamp(0, max_line));
+            term.grid.cursor.point.line = Line((term.grid.cursor.point.line.0 + scroll_lines).clamp(0, max_line));
             term.grid.saved_cursor.point.line = Line((term.grid.saved_cursor.point.line.0 + scroll_lines).clamp(0, max_line));
             // scroll down introduces blank lines at the top of the history - remove them
             term.grid.decrease_scroll_limit(scroll_lines as usize);
-            log::warn!(
-                "AIR-5316 shrink-branch: scroll_lines={scroll_lines} raw_new_cursor={raw_new} clamped_cursor={} overshoot={}",
-                term.grid.cursor.point.line.0,
-                raw_new - max_line
-            );
         }
 
     } else if history_size_change < 0 {
