@@ -26,10 +26,16 @@ pub fn adjust_to_conpty_resize_behavior<T>(term: &mut Term<T>, history_size_befo
                 break;
             }
         }
+        // Cap to the cursor's distance from the bottom: scrolling the cursor's own line out ejects
+        // the trailing blank growth line into history (where the cursor can't follow), so the next
+        // write overwrites real content. (AIR-5316)
+        let scroll_lines = scroll_lines.min((term.bottommost_line().0 - term.grid.cursor.point.line.0).max(0));
         if scroll_lines > 0 {
             term.scroll_down_relative(term.topmost_line(), scroll_lines as usize);
-            term.grid.cursor.point.line += scroll_lines;
-            term.grid.saved_cursor.point.line += scroll_lines;
+            // Clamp into the viewport; an out-of-range cursor later indexes the grid out of bounds. (AIR-5316)
+            let max_line = term.bottommost_line().0;
+            term.grid.cursor.point.line = Line((term.grid.cursor.point.line.0 + scroll_lines).clamp(0, max_line));
+            term.grid.saved_cursor.point.line = Line((term.grid.saved_cursor.point.line.0 + scroll_lines).clamp(0, max_line));
             // scroll down introduces blank lines at the top of the history - remove them
             term.grid.decrease_scroll_limit(scroll_lines as usize);
         }
@@ -39,8 +45,10 @@ pub fn adjust_to_conpty_resize_behavior<T>(term: &mut Term<T>, history_size_befo
         // scroll up introduces blank lines at the bottom of the screen (similar to scroll down)
         // however these can stay
         term.scroll_up_relative(Line(0), scroll_lines as usize);
-        term.grid.cursor.point.line -= scroll_lines;
-        term.grid.saved_cursor.point.line -= scroll_lines;
+        // Clamp into the viewport; a negative cursor line underflows to a huge usize on indexing. (AIR-5316)
+        let max_line = term.bottommost_line().0;
+        term.grid.cursor.point.line = Line((term.grid.cursor.point.line.0 - scroll_lines).clamp(0, max_line));
+        term.grid.saved_cursor.point.line = Line((term.grid.saved_cursor.point.line.0 - scroll_lines).clamp(0, max_line));
     }
     term.mark_fully_damaged();
 }
