@@ -208,6 +208,13 @@ where
 
     pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
         thread::spawn_named("PTY reader", move || {
+            // AIR-TRUNC-DIAG: unconditional build marker on a path we KNOW runs once per PTY launch.
+            // If this line is absent from fsdaemon.log, the patched alacritty_terminal is not the one
+            // running. drain_on_exit shows whether the lib.rs EventLoop::new flag propagated.
+            log::warn!(
+                "AIR-TRUNC-DIAG PTY-reader thread start (build=drain-fix-v2, drain_on_exit={})",
+                self.drain_on_exit
+            );
             let mut state = State::default();
             let mut buf = [0u8; READ_BUFFER_SIZE];
 
