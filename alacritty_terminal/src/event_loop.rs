@@ -108,7 +108,7 @@ where
         state: &mut State,
         buf: &mut [u8],
         mut writer: Option<&mut X>,
-    ) -> io::Result<()>
+    ) -> io::Result<usize>
     where
         X: Write,
     {
@@ -171,7 +171,7 @@ where
             self.event_proxy.send_event(Event::Wakeup);
         }
 
-        Ok(())
+        Ok(processed)
     }
 
     #[inline]
@@ -266,7 +266,76 @@ where
                                     self.event_proxy.send_event(Event::ChildExit(code));
                                 }
                                 if self.drain_on_exit {
-                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                    // AIR-5738: on Windows the agent's final output is dropped at terminal teardown
+                                    // (its last chat message is missing although the on-disk transcript is complete).
+                                    // Drain the tail here, before teardown.
+                                    //
+                                    // Windows/ConPTY facts (why this is Windows-only and is not a plain read-to-EOF):
+                                    //  - conhost owns the output pipe, not the child; the child exiting does NOT close
+                                    //    it, so ReadFile never returns EOF/ERROR_BROKEN_PIPE here. The pipe breaks only
+                                    //    on ClosePseudoConsole, which runs later at teardown, not now.
+                                    //  - child-exit and output are unordered: exit is signalled by the process-handle
+                                    //    wait (tty::windows::child) on one thread while conhost pumps output into a
+                                    //    separate reader thread (tty::windows::blocking); the tail can still be arriving
+                                    //    when the exit event lands, so a single read loses it.
+                                    //  - that reader folds "no data yet" (WouldBlock) and EOF both into Ok(0), so even
+                                    //    the eventual EOF would be indistinguishable here.
+                                    //  => there is no EOF to read to; detect end-of-tail by quiescence. The child is
+                                    //     dead and what conhost holds is bounded (screen buffer + pending output), so
+                                    //     the tail is finite and a gap of QUIET_WINDOW means "drained".
+                                    //  Refs: MS docs "Creating a Pseudoconsole session" (service the pipe on its own
+                                    //  thread, read until it breaks of its own accord) and "ClosePseudoConsole";
+                                    //  microsoft/terminal#1810 (close hangs), #4050 (conhost lingers, pipe open until
+                                    //  close). 24H2 / build 26100+ made ClosePseudoConsole non-blocking, but the pipe
+                                    //  still closes only at close-time, so this drain is still required.
+                                    //
+                                    // Rejected (deterministic) alternative: force ClosePseudoConsole now, then read to
+                                    // the real EOF. The correct form needs a separate close thread to dodge the
+                                    // pre-24H2 "close blocks until the pipe is drained" deadlock (terminal#329); it
+                                    // reorders shutdown of shared upstream console code — blast radius too large.
+                                    // Candidate for an upstream report instead.
+                                    //
+                                    // Constants:
+                                    //  QUIET_WINDOW - a pause longer than this is read as end-of-tail. Bytes are parsed
+                                    //    as they arrive, so delivery is immediate; this only delays loop exit/teardown.
+                                    //    Too low truncates; too high adds teardown latency. Only failure mode: a mid-tail
+                                    //    stall exceeding it under severe scheduling starvation (unlikely - all the data
+                                    //    is already sitting in conhost).
+                                    //  HARD_CAP - last-resort backstop only; correct runs always exit via QUIET_WINDOW
+                                    //    long before it. Set generously so it can never cut a slow-but-legitimate drain
+                                    //    on a loaded machine; a truly never-quiet pipe parks this (the PTY reader) thread
+                                    //    until the cap, which is acceptable at teardown.
+                                    #[cfg(windows)]
+                                    {
+                                        use std::time::Duration;
+                                        const QUIET_WINDOW: Duration = Duration::from_millis(50);
+                                        const HARD_CAP: Duration = Duration::from_millis(60_000);
+                                        const POLL_PAUSE: Duration = Duration::from_millis(2);
+                                        let started = Instant::now();
+                                        let mut last_data = started;
+                                        loop {
+                                            let now = Instant::now();
+                                            if now.duration_since(started) >= HARD_CAP {
+                                                break;
+                                            }
+                                            match self.pty_read(&mut state, &mut buf, pipe.as_mut()) {
+                                                Ok(0) => {
+                                                    if now.duration_since(last_data) >= QUIET_WINDOW {
+                                                        break;
+                                                    }
+                                                    std::thread::sleep(POLL_PAUSE);
+                                                },
+                                                Ok(_) => last_data = now,
+                                                Err(_) => break,
+                                            }
+                                        }
+                                    }
+                                    // Unix/macOS: the PTY master returns the buffered tail and then a real EOF on child
+                                    // exit, so upstream's single read suffices and adds no teardown latency.
+                                    #[cfg(not(windows))]
+                                    {
+                                        let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                    }
                                 }
                                 self.event_proxy.send_event(Event::Exit);
                                 self.event_proxy.send_event(Event::Wakeup);
