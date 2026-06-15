@@ -108,7 +108,7 @@ where
         state: &mut State,
         buf: &mut [u8],
         mut writer: Option<&mut X>,
-    ) -> io::Result<()>
+    ) -> io::Result<usize>
     where
         X: Write,
     {
@@ -171,7 +171,7 @@ where
             self.event_proxy.send_event(Event::Wakeup);
         }
 
-        Ok(())
+        Ok(processed)
     }
 
     #[inline]
@@ -266,7 +266,23 @@ where
                                     self.event_proxy.send_event(Event::ChildExit(code));
                                 }
                                 if self.drain_on_exit {
-                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                    // AIR-5738: a fast-exiting child's final output can still be buffered
+                                    // or arriving (notably Windows ConPTY); a single read stops at WouldBlock
+                                    // before EOF. Drain until the PTY is quiet, bounded so it can't wedge.
+                                    let mut empty = 0u32;
+                                    for _ in 0..512 {
+                                        match self.pty_read(&mut state, &mut buf, pipe.as_mut()) {
+                                            Ok(0) => {
+                                                empty += 1;
+                                                if empty >= 4 {
+                                                    break;
+                                                }
+                                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                            },
+                                            Ok(_) => empty = 0,
+                                            Err(_) => break,
+                                        }
+                                    }
                                 }
                                 self.event_proxy.send_event(Event::Exit);
                                 self.event_proxy.send_event(Event::Wakeup);
