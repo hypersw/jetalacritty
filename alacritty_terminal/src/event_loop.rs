@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::error;
 use polling::{Event as PollingEvent, Events, PollMode};
@@ -266,20 +266,47 @@ where
                                     self.event_proxy.send_event(Event::ChildExit(code));
                                 }
                                 if self.drain_on_exit {
-                                    // AIR-5738: a fast-exiting child's final output can still be buffered
-                                    // or arriving (notably Windows ConPTY); a single read stops at WouldBlock
-                                    // before EOF. Drain until the PTY is quiet, bounded so it can't wedge.
-                                    let mut empty = 0u32;
-                                    for _ in 0..512 {
+                                    // AIR-5738: drain the child's final output before we tear the terminal down,
+                                    // otherwise its closing bytes are lost (the symptom: an agent's last chat
+                                    // message goes missing while its on-disk transcript is intact).
+                                    //
+                                    // Why this can't just "read to EOF": the child has exited, but on Windows
+                                    // ConPTY its last writes are still held in conhost. conhost flushes them onto
+                                    // the output pipe around child exit, but does NOT close the pipe — there is no
+                                    // EOF / ERROR_BROKEN_PIPE until the pseudoconsole is closed, which happens later
+                                    // at teardown (ClosePseudoConsole), not here. (Microsoft's guidance is to keep
+                                    // reading "until the pipe has been closed"; that close is simply not available
+                                    // at this point in the lifecycle.) On top of that, our Windows reader collapses
+                                    // both "no data yet" (WouldBlock) and EOF into Ok(0) (see tty::windows::blocking),
+                                    // so even the eventual EOF would be indistinguishable here.
+                                    //
+                                    // So we drain by quiescence instead: read the flushed tail until the pipe yields
+                                    // nothing for QUIET_WINDOW, i.e. conhost has handed us everything it buffered.
+                                    // What conhost buffers is bounded (screen buffer + pending output) and the child
+                                    // is already dead, so the tail is finite and this converges on its own; HARD_CAP
+                                    // is only a wall-clock backstop so a wedged/never-quiet pipe can't block teardown
+                                    // forever. Both limits are wall-clock, not iteration/byte counts, so they do not
+                                    // depend on read sizes or buffer capacity. Bytes are parsed as they are read, so
+                                    // the message reaches the consumer immediately; QUIET_WINDOW only delays loop
+                                    // exit (and thus teardown), never delivery.
+                                    const QUIET_WINDOW: Duration = Duration::from_millis(50);
+                                    const HARD_CAP: Duration = Duration::from_millis(2000);
+                                    const POLL_PAUSE: Duration = Duration::from_millis(2);
+                                    let started = Instant::now();
+                                    let mut last_data = started;
+                                    loop {
+                                        let now = Instant::now();
+                                        if now.duration_since(started) >= HARD_CAP {
+                                            break;
+                                        }
                                         match self.pty_read(&mut state, &mut buf, pipe.as_mut()) {
                                             Ok(0) => {
-                                                empty += 1;
-                                                if empty >= 4 {
+                                                if now.duration_since(last_data) >= QUIET_WINDOW {
                                                     break;
                                                 }
-                                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                                std::thread::sleep(POLL_PAUSE);
                                             },
-                                            Ok(_) => empty = 0,
+                                            Ok(_) => last_data = now,
                                             Err(_) => break,
                                         }
                                     }
