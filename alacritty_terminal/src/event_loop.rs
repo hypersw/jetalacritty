@@ -108,7 +108,7 @@ where
         state: &mut State,
         buf: &mut [u8],
         mut writer: Option<&mut X>,
-    ) -> io::Result<()>
+    ) -> io::Result<usize>
     where
         X: Write,
     {
@@ -171,7 +171,7 @@ where
             self.event_proxy.send_event(Event::Wakeup);
         }
 
-        Ok(())
+        Ok(processed)
     }
 
     #[inline]
@@ -266,7 +266,37 @@ where
                                     self.event_proxy.send_event(Event::ChildExit(code));
                                 }
                                 if self.drain_on_exit {
-                                    let _ = self.pty_read(&mut state, &mut buf, pipe.as_mut());
+                                    // The child has exited, but bytes it wrote just before exiting can still
+                                    // be buffered in / arriving from the PTY — notably on Windows ConPTY,
+                                    // which emits a final burst during teardown. A single non-blocking read
+                                    // returns at WouldBlock long before the real EOF, so the tail of the
+                                    // output is otherwise silently lost. Keep reading until the PTY is
+                                    // genuinely quiet (several consecutive empty reads), bounded so a
+                                    // misbehaving PTY can never wedge the event loop.
+                                    let mut empty_reads = 0u32;
+                                    let mut drained_after_exit = 0usize;
+                                    for _ in 0..512 {
+                                        match self.pty_read(&mut state, &mut buf, pipe.as_mut()) {
+                                            Ok(0) => {
+                                                empty_reads += 1;
+                                                if empty_reads >= 4 {
+                                                    break;
+                                                }
+                                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                            },
+                                            Ok(n) => {
+                                                drained_after_exit += n;
+                                                empty_reads = 0;
+                                            },
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    // AIR-TRUNC-DIAG: proves the patched fsdaemon is live and shows how much tail
+                                    // was recovered post-exit. Appears in %LOCALAPPDATA%\JetBrains\Air\log\fsdaemon\fsdaemon.log.
+                                    log::warn!(
+                                        "AIR-TRUNC-DIAG drained {} bytes from PTY after child exit (drain_on_exit)",
+                                        drained_after_exit
+                                    );
                                 }
                                 self.event_proxy.send_event(Event::Exit);
                                 self.event_proxy.send_event(Event::Wakeup);
