@@ -280,6 +280,10 @@ where
                                     // both "no data yet" (WouldBlock) and EOF into Ok(0) (see tty::windows::blocking),
                                     // so even the eventual EOF would be indistinguishable here.
                                     //
+                                    // Refs: MS docs "ClosePseudoConsole" (keep reading the output pipe until it is
+                                    // closed); microsoft/terminal#1810 (close hangs) and #4050 (conhost lingers, pipe
+                                    // not closed until ClosePseudoConsole).
+                                    //
                                     // So we drain by quiescence instead: read the flushed tail until the pipe yields
                                     // nothing for QUIET_WINDOW, i.e. conhost has handed us everything it buffered.
                                     // What conhost buffers is bounded (screen buffer + pending output) and the child
